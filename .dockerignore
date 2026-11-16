@@ -1,0 +1,7 @@
+.env
+.env.example
+.git
+__pycache__/
+workspace/
+*.md
+run.ps1
