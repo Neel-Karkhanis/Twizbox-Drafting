@@ -128,6 +128,50 @@ def facts_write_file(args: dict) -> dict:
     }
 
 
+# --- delete_file ------------------------------------------------------------
+
+def _check_delete(args: dict):
+    path = sandbox.safe_path(_require_str(args, "path"))
+    if path.is_dir():
+        raise ToolError(
+            f"Path is a directory; only files can be deleted: {sandbox.display_path(path)}"
+        )
+    if not path.is_file():
+        raise ToolError(f"File not found: {sandbox.display_path(path)}")
+    return path
+
+
+def delete_file(args: dict) -> str:
+    path = _check_delete(args)
+    backup = sandbox.backup_file(path)
+    path.unlink()
+    return (
+        f"Deleted {sandbox.display_path(path)}. "
+        f"A copy was kept in {sandbox.display_path(backup)}."
+    )
+
+
+def preview_delete_file(args: dict) -> str:
+    """Shown in the approval prompt: what is about to be deleted."""
+    path = _check_delete(args)
+    size = path.stat().st_size
+    header = f"DELETES existing file ({size:,} bytes; a backup is kept)."
+    try:
+        content = _read_text(path)
+    except ToolError as exc:
+        return f"{header} Content can't be shown ({exc})"
+    return f"{header} Current content:\n" + _clip(content.splitlines())
+
+
+def facts_delete_file(args: dict) -> dict:
+    """Facts for the auto-classifier. Size only, never the file's contents."""
+    path = _check_delete(args)
+    return {
+        "target": "existing file (will be deleted; a backup copy is kept)",
+        "current size": f"{path.stat().st_size:,} bytes",
+    }
+
+
 # --- get_current_time -------------------------------------------------------
 
 def get_current_time(args: dict) -> str:
@@ -193,6 +237,18 @@ TOOLS: dict[str, Tool] = {
         write_file,
         preview_write_file,
         facts_write_file,
+    ),
+    "delete_file": Tool(
+        _schema(
+            "delete_file",
+            "Delete a single file from the workspace. Folders can't be deleted. "
+            "Only use this when the user asks for the file to be removed.",
+            {"path": {"type": "string", "description": _PATH_DESC}},
+            ["path"],
+        ),
+        delete_file,
+        preview_delete_file,
+        facts_delete_file,
     ),
     "get_current_time": Tool(
         _schema("get_current_time", "Get the current local date and time.", {}, []),

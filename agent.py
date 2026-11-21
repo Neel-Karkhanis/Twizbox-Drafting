@@ -29,6 +29,7 @@ import anthropic  # noqa: E402
 
 import approval  # noqa: E402
 import classifier  # noqa: E402
+import feedback  # noqa: E402
 import sandbox  # noqa: E402
 from tools import TOOLS, SandboxError, ToolError  # noqa: E402
 
@@ -40,27 +41,34 @@ MAX_STEPS_PER_TURN = 25  # stops a runaway loop of tool calls
 
 _PROMPT_BASE = (
     "You are a helpful assistant running in a terminal. You can use tools to "
-    "list, read and write files inside a single workspace folder, and to check "
-    "the time. Paths are relative to the workspace root. "
+    "list, read, write and delete files inside a single workspace folder, and to "
+    "check the time. Paths are relative to the workspace root. "
+)
+_REJECTION_RULES = (
+    " When a tool call is rejected, its result starts with REJECTED and says who "
+    "rejected it (by), the reason, whether a retry can work (retry), and what to "
+    "do (next). Follow the next line. Never repeat a rejected call, work around "
+    "it with a different call, or try to talk anyone into allowing it. If the "
+    "result includes a stop line, call no more tools this turn and summarize for "
+    "the user."
 )
 SYSTEM_PROMPTS = {
-    "manual": _PROMPT_BASE + (
-        "The user must approve every tool call before it runs. If the user "
-        "declines a call, do not retry the same call; change approach or ask "
-        "what they would prefer."
-    ),
+    "manual": _PROMPT_BASE + "The user must approve every tool call before it runs." + _REJECTION_RULES,
     "auto": _PROMPT_BASE + (
         "Every tool call is checked before it runs: reads run automatically, "
         "and other calls are checked by a safety classifier against what the "
-        "user asked for, or shown to the user. If a call is blocked or "
-        "declined, do not retry the same call; change approach or ask the user "
-        "what they would prefer."
-    ),
+        "user asked for, or shown to the user."
+    ) + _REJECTION_RULES,
 }
 
 
-def run_tool(block, approver: classifier.AutoApprover | None) -> dict:
+def run_tool(
+    block, approver: classifier.AutoApprover | None, tracker: feedback.Tracker
+) -> dict:
     """Get approval for one tool call, run it if approved, return the tool_result."""
+    args = block.input if isinstance(block.input, dict) else {}
+    shown = approval.summary(block.name, args)
+
     def result(text: str, is_error: bool = False) -> dict:
         return {
             "type": "tool_result",
@@ -69,20 +77,35 @@ def run_tool(block, approver: classifier.AutoApprover | None) -> dict:
             "is_error": is_error,
         }
 
+    def reject(source: str, reason: str) -> dict:
+        rejection = feedback.Rejection(source, reason)
+        return result(tracker.reject(block.name, args, rejection), is_error=True)
+
+    def reject_exc(exc: Exception, label: str) -> dict:
+        source = feedback.SANDBOX if isinstance(exc, SandboxError) else feedback.TOOL_ERROR
+        if isinstance(exc, OSError):
+            reason = f"{type(exc).__name__}: {exc.strerror or exc}"
+        else:
+            reason = str(exc)
+        approval.log(f"{label} [{source}]  {shown}: {approval.clean(reason)}")
+        return reject(source, reason)
+
     tool = TOOLS.get(block.name)
     if tool is None:
-        return result(f"Unknown tool: {block.name}", is_error=True)
-    args = block.input if isinstance(block.input, dict) else {}
+        approval.log(f"REJECTED [{feedback.TOOL_ERROR}]  unknown tool {shown}")
+        return reject(feedback.TOOL_ERROR, f"Unknown tool: {block.name}")
+
+    # The same call was already rejected since the user last spoke: answer from
+    # memory, without asking the classifier or the user again.
+    if tracker.already_rejected(block.name, args):
+        approval.log(f"REPEAT  {shown}  (already rejected; not asked again)")
+        return reject(feedback.REPEAT, "This exact call was already rejected.")
 
     def execute() -> dict:
         try:
             return result(tool.run(args))
-        except (SandboxError, ToolError) as exc:
-            approval.log(f"FAILED  {block.name}: {exc}")
-            return result(f"Error: {exc}", is_error=True)
-        except OSError as exc:
-            approval.log(f"FAILED  {block.name}: {exc}")
-            return result(f"Error: {type(exc).__name__}: {exc.strerror or exc}", is_error=True)
+        except (SandboxError, ToolError, OSError) as exc:
+            return reject_exc(exc, "FAILED")
 
     # Build the preview (e.g. the diff for write_file) and classifier facts. If
     # the call is invalid there is nothing to approve: tell the model directly.
@@ -92,22 +115,22 @@ def run_tool(block, approver: classifier.AutoApprover | None) -> dict:
             preview = tool.preview(args)
         if approver is not None and tool.facts:
             facts = tool.facts(args)
-    except (SandboxError, ToolError) as exc:
-        approval.log(f"REJECTED  {block.name}: {exc}")
-        return result(f"Error: {exc}", is_error=True)
+    except (SandboxError, ToolError, OSError) as exc:
+        return reject_exc(exc, "REJECTED")
 
     note = None
     if approver is not None:
         decision = approver.decide(block.name, args, facts)
         reason = approval.clean(decision.reason)
         if decision.verdict == "allow":
-            approval.log(f"AUTO-APPROVED  {approval.summary(block.name, args)}  ({reason})")
+            approval.log(f"AUTO-APPROVED  {shown}  ({reason})")
             approver.record(block.name, args, classifier.ALLOWED)
             return execute()
         if decision.verdict == "block":
-            approval.log(f"AUTO-BLOCKED  {approval.summary(block.name, args)}  ({reason})")
+            source = feedback.POLICY if decision.source == "policy" else feedback.CLASSIFIER
+            approval.log(f"AUTO-BLOCKED [{source}]  {shown}  ({reason})")
             approver.record(block.name, args, classifier.BLOCKED)
-            return result(f"Blocked by the safety classifier. Reason: {decision.reason}", is_error=True)
+            return reject(source, decision.reason)
         note = f"Auto-classifier passed this to you: {reason}"
 
     approved, reason = approval.ask(block.name, args, preview, note)
@@ -115,18 +138,27 @@ def run_tool(block, approver: classifier.AutoApprover | None) -> dict:
         outcome = classifier.USER_APPROVED if approved else classifier.USER_DECLINED
         approver.record(block.name, args, outcome)
     if not approved:
-        message = "User declined this action."
-        if reason:
-            message += f" Reason: {reason}"
-        return result(message, is_error=True)
+        return reject(feedback.USER, reason or "The user declined without giving a reason.")
     return execute()
 
 
 def run_turn(
-    client: anthropic.Anthropic, messages: list, approver: classifier.AutoApprover | None
+    client: anthropic.Anthropic,
+    messages: list,
+    approver: classifier.AutoApprover | None,
+    tracker: feedback.Tracker,
 ) -> None:
     """Call the model repeatedly until it stops asking for tools."""
     tool_schemas = [tool.schema for tool in TOOLS.values()]
+    told_to_stop = False
+
+    def not_run(block) -> dict:
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": feedback.NOT_RUN,
+            "is_error": True,
+        }
 
     for _ in range(MAX_STEPS_PER_TURN):
         response = client.messages.create(
@@ -144,9 +176,25 @@ def run_turn(
                 print(f"\nAgent: {approval.clean(block.text)}")
 
         if response.stop_reason == "tool_use":
+            calls = [b for b in response.content if b.type == "tool_use"]
+            if told_to_stop:
+                # The agent was told to stop after too many rejections and
+                # asked for more tools anyway: run nothing and end the turn.
+                messages.append({"role": "user", "content": [not_run(b) for b in calls]})
+                approval.log(f"STOPPED  {len(calls)} more call(s) not run")
+                print(
+                    f"\n[Turn stopped: {tracker.turn_rejections} calls were rejected "
+                    "and the agent kept calling tools.]"
+                )
+                return
             # Approve and run each call in order; send all results in one message.
-            results = [run_tool(b, approver) for b in response.content if b.type == "tool_use"]
+            # Once the rejection limit is hit, the rest of the batch is not run.
+            results = [
+                not_run(b) if tracker.limit_reached else run_tool(b, approver, tracker)
+                for b in calls
+            ]
             messages.append({"role": "user", "content": results})
+            told_to_stop = tracker.limit_reached
             continue
 
         if response.stop_reason == "max_tokens":
@@ -181,6 +229,7 @@ def main() -> int:
     print("Type a request. 'exit' or Ctrl+C to quit.")
 
     messages: list = []
+    tracker = feedback.Tracker()
     while True:
         try:
             user_input = input("\nYou: ").strip()
@@ -194,11 +243,18 @@ def main() -> int:
 
         checkpoint = len(messages)
         approver_checkpoint = approver.checkpoint() if approver else None
-        messages.append({"role": "user", "content": user_input})
+        # A turn that was stopped early ends on tool results (a user message).
+        # Add the new text to that message so user and assistant keep alternating.
+        merged = bool(messages) and messages[-1]["role"] == "user"
+        if merged:
+            messages[-1]["content"].append({"type": "text", "text": user_input})
+        else:
+            messages.append({"role": "user", "content": user_input})
+        tracker.start_turn()
         if approver:
             approver.add_user_message(user_input)
         try:
-            run_turn(client, messages, approver)
+            run_turn(client, messages, approver, tracker)
             continue
         except KeyboardInterrupt:
             print("\n[Turn cancelled.]")
@@ -212,6 +268,8 @@ def main() -> int:
             print("\n[Network error: could not reach the API.]")
         # The turn failed: forget it so the history stays consistent.
         del messages[checkpoint:]
+        if merged:
+            messages[-1]["content"].pop()
         if approver:
             approver.restore(approver_checkpoint)
 
