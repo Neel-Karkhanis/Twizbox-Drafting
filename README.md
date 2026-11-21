@@ -1,7 +1,8 @@
 # Twizbox agent (draft)
 
-A terminal agent where the model can ask for a utility, and nothing runs until you
-type `y`. There is no "always allow".
+A terminal agent where the model can ask for a utility. By default nothing runs
+until you type `y`, and there is no "always allow". An optional auto mode lets a
+classifier model approve calls that match what you asked for (see below).
 
 ## Setup
 
@@ -30,10 +31,29 @@ Type `exit` or press Ctrl+C to quit.
 | `write_file` | Creates or overwrites a file (shows a diff first, keeps a backup) |
 | `get_current_time` | Returns the local date and time |
 
+## Approval modes
+
+Set `APPROVAL_MODE` in `.env`:
+
+- `manual` (default): every call is shown and needs an explicit `y`.
+- `auto`: modelled on Claude Code's auto mode.
+  - Reads (`list_directory`, `read_file`, `get_current_time`) run without asking.
+  - Writes go to a classifier: a second call to the same model and key
+    (`CLASSIFIER_MODEL` overrides the model). It sees only what you typed and the
+    tool calls the agent made (names and arguments). It never sees the agent's
+    own text or any tool results, so a file the agent read can't talk it into
+    anything.
+  - If the classifier blocks a call, the reason goes back to the agent.
+  - After 3 blocks in a row (until something is approved), or 10 in a session,
+    calls come to you instead.
+  - If the classifier errors or gives an unusable answer, the call comes to you.
+    It never allows anything by default.
+
 ## Safety layers
 
-1. **Approval** (`approval.py`): every call is shown and needs an explicit `y`.
-   A "no" is sent back to the model as "User declined", with your reason if given.
+1. **Approval** (`approval.py`, `classifier.py`): you or the classifier approve
+   each call, as set by `APPROVAL_MODE`. A "no" is sent back to the model with
+   the reason.
 2. **Path jail** (`sandbox.py`): tools can only touch `workspace/`. Paths that
    escape it, and names like `.env`, `*.key`, `.git`, are refused. Reads are
    capped at 200 KB and writes at 1 MB.
@@ -45,8 +65,9 @@ Type `exit` or press Ctrl+C to quit.
 
 ## Files
 
-- `agent.py`: chat loop; asks for approval, then runs the tool
+- `agent.py`: chat loop; gets approval, then runs the tool
 - `approval.py`: the y/n prompt
+- `classifier.py`: the auto-mode classifier
 - `tools.py`: the four utilities and their schemas
 - `sandbox.py`: path jail, limits, backups
 - `Dockerfile`, `run.ps1`: container setup
@@ -55,4 +76,6 @@ Type `exit` or press Ctrl+C to quit.
 
 Write a function in `tools.py` that takes the argument dict and returns a string,
 then add it to `TOOLS` with a schema. It gets the approval prompt automatically.
+In auto mode it goes to the classifier unless you add it to `READ_ONLY_TOOLS` in
+`classifier.py`, which you should only do for tools that change nothing.
 Use `sandbox.safe_path()` for any file path.

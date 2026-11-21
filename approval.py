@@ -11,23 +11,33 @@ def clean(text: str) -> str:
     return "".join(ch if ch in "\n\t" or ch.isprintable() else "?" for ch in text)
 
 
-def _short(value) -> str:
-    if isinstance(value, str) and len(value) > MAX_VALUE_CHARS:
-        return f"{value[:MAX_VALUE_CHARS]!r}... ({len(value):,} chars total)"
+def _short(value, limit: int = MAX_VALUE_CHARS) -> str:
+    if isinstance(value, str) and len(value) > limit:
+        return f"{value[:limit]!r}... ({len(value):,} chars total)"
     return repr(value)
+
+
+def summary(tool_name: str, args: dict) -> str:
+    """One-line description of a call, for log lines."""
+    shown = ", ".join(f"{clean(str(k))}={clean(_short(v, 60))}" for k, v in args.items())
+    return f"{clean(tool_name)}({shown})"
 
 
 def log(message: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
 
-def ask(tool_name: str, args: dict, preview: str | None = None) -> tuple[bool, str]:
+def ask(
+    tool_name: str, args: dict, preview: str | None = None, note: str | None = None
+) -> tuple[bool, str]:
     """Show a pending tool call and block until the user answers.
 
     Returns (approved, reason). Only an explicit 'y'/'yes' approves.
     """
     print()
     print("=" * 64)
+    if note:
+        print(clean(note))
     print(f"Agent wants to run: {clean(tool_name)}")
     if not args:
         print("   (no arguments)")

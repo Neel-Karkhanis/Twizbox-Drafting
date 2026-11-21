@@ -115,6 +115,19 @@ def preview_write_file(args: dict) -> str:
     return "OVERWRITES existing file (a backup is kept). Diff:\n" + _clip(diff)
 
 
+def facts_write_file(args: dict) -> dict:
+    """Facts for the auto-classifier. Sizes only, never the file's contents."""
+    path, content = _check_write(args)
+    new_size = f"{len(content.encode('utf-8')):,} bytes"
+    if not path.exists():
+        return {"target": "new file (does not exist yet)", "new content size": new_size}
+    return {
+        "target": "existing file (will be overwritten)",
+        "current size": f"{path.stat().st_size:,} bytes",
+        "new content size": new_size,
+    }
+
+
 # --- get_current_time -------------------------------------------------------
 
 def get_current_time(args: dict) -> str:
@@ -128,6 +141,8 @@ class Tool:
     schema: dict
     run: Callable[[dict], str]
     preview: Callable[[dict], str] | None = None
+    # Extra facts for the auto-classifier (e.g. whether a write overwrites).
+    facts: Callable[[dict], dict] | None = None
 
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -177,6 +192,7 @@ TOOLS: dict[str, Tool] = {
         ),
         write_file,
         preview_write_file,
+        facts_write_file,
     ),
     "get_current_time": Tool(
         _schema("get_current_time", "Get the current local date and time.", {}, []),
